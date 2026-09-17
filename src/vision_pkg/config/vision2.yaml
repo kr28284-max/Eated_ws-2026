@@ -1,0 +1,22 @@
+vision_node2:
+  ros__parameters:
+    confidence_threshold: 0.5
+    rgb_topic: /realsense/d435i/color/image_raw
+    depth_topic: /realsense/d435i/aligned_depth_to_color/image_raw
+    camera_info_topic: /realsense/d435i/color/camera_info
+    camera_frame: d435i_color_optical_frame
+    target_frame: base_link
+    stable_detection_duration: 3.0
+    recognition_timeout: 10.0
+    depth_window_size: 7
+    depth_scale: 0.001
+    max_frame_age: 0.5
+    tf_timeout: 0.2
+    min_valid_samples: 10
+    max_inference_rate_hz: 10.0
+    sync_queue_size: 5
+    sync_slop: 0.05
+    debug_display_rate_hz: 60.0
+    show_debug_window: true
+    debug_window_title: EATED Vision - live / on-demand YOLO
+    overlay_max_age: 1.0

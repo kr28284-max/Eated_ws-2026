@@ -1,0 +1,24 @@
+# ROS 2 / colcon build products
+build/
+install/
+log/
+
+# Python caches and packaging artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# ROS runtime artifacts
+*.bag
+*.db3
+

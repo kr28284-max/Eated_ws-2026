@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly WORKSPACE="/home/fcsl/eated_ws"
+readonly TERMINATOR_CONFIG="$WORKSPACE/eated_terminator.conf"
+
+if ! command -v terminator >/dev/null 2>&1; then
+    echo "오류: terminator가 설치되어 있지 않습니다." >&2
+    exit 1
+fi
+
+if [[ ! -f "$TERMINATOR_CONFIG" ]]; then
+    echo "오류: Terminator 설정 파일을 찾을 수 없습니다: $TERMINATOR_CONFIG" >&2
+    exit 1
+fi
+
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    echo "오류: 그래픽 세션에서 실행해야 합니다." >&2
+    exit 1
+fi
+
+exec terminator \
+    --no-dbus \
+    --maximise \
+    --title="EATED Robot Control" \
+    --config="$TERMINATOR_CONFIG" \
+    --layout=eated
+
