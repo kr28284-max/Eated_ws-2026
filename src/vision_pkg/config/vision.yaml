@@ -6,7 +6,7 @@ vision_node:
     camera_info_topic: /realsense/d435i/color/camera_info
     camera_frame: d435i_color_optical_frame
     target_frame: base_link
-    stable_detection_duration: 3.0
+    stable_detection_duration: 2.0
     recognition_timeout: 10.0
     depth_window_size: 7
     depth_scale: 0.001

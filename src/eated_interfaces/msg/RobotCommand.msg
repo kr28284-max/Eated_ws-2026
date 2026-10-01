@@ -1,6 +1,7 @@
 std_msgs/Header header
 
 string ACTION_FETCH=fetch
+string ACTION_STOP=stop
 string ACTION_UNKNOWN=unknown
 
 string action

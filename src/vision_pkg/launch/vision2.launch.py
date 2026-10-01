@@ -52,6 +52,14 @@ def generate_launch_description():
         parameters=[config_path, {'model_path': model_path}],
     )
 
+    hand_gesture_node = Node(
+        package='vision_pkg',
+        executable='hand_gesture_node',
+        name='hand_gesture_node',
+        output='screen',
+        parameters=[config_path],
+    )
+
     camera_mount_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
@@ -79,5 +87,5 @@ def generate_launch_description():
     )
 
     return LaunchDescription(
-        declared_arguments + [camera_mount_tf, vision_node]
+        declared_arguments + [camera_mount_tf, vision_node, hand_gesture_node]
     )

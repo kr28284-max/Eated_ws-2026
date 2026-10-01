@@ -14,8 +14,10 @@ import rclpy
 import torch
 from cv_bridge import CvBridgeError
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool, Float32, String
 
 from vision_pkg.vision_node import FrameObservation
 from vision_pkg.vision_node import VisionNode
@@ -53,6 +55,12 @@ class VisionNode2(VisionNode):
         self._window_warning_logged = False
         self._inference_warmup_lock = threading.Lock()
         self._inference_warmed_up = False
+        self._gesture_lock = threading.Lock()
+        self._control_state = ''
+        self._open_palm_detected = False
+        self._open_palm_updated_at = 0.0
+        self._release_remaining_seconds: Optional[float] = None
+        self._countdown_updated_at = 0.0
 
         super().__init__()
 
@@ -70,6 +78,30 @@ class VisionNode2(VisionNode):
             self.rgb_topic,
             self.live_rgb_callback,
             qos_profile_sensor_data,
+            callback_group=self.callback_group,
+        )
+        state_qos = QoSProfile(depth=1)
+        state_qos.reliability = ReliabilityPolicy.RELIABLE
+        state_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.control_state_subscription = self.create_subscription(
+            String,
+            '/control/state',
+            self.control_state_callback,
+            state_qos,
+            callback_group=self.callback_group,
+        )
+        self.palm_subscription = self.create_subscription(
+            Bool,
+            '/vision/open_palm',
+            self.open_palm_callback,
+            10,
+            callback_group=self.callback_group,
+        )
+        self.countdown_subscription = self.create_subscription(
+            Float32,
+            '/control/release_countdown_sec',
+            self.release_countdown_callback,
+            10,
             callback_group=self.callback_group,
         )
 
@@ -208,6 +240,7 @@ class VisionNode2(VisionNode):
 
         image = np.asarray(rgb_image).copy()
         self._draw_live_overlay(image, now)
+        self._draw_hand_overlay(image, now)
         self._update_display_fps(now)
 
         try:
@@ -223,6 +256,80 @@ class VisionNode2(VisionNode):
 
         with self._display_lock:
             self._latest_display_image = image
+
+    def control_state_callback(self, msg: String) -> None:
+        """Follow the controller's current delivery phase."""
+        with self._gesture_lock:
+            if msg.data != self._control_state:
+                self._open_palm_detected = False
+                self._release_remaining_seconds = None
+            self._control_state = msg.data
+
+    def open_palm_callback(self, msg: Bool) -> None:
+        """Cache the latest MediaPipe hand decision."""
+        with self._gesture_lock:
+            self._open_palm_detected = bool(msg.data)
+            self._open_palm_updated_at = time.monotonic()
+
+    def release_countdown_callback(self, msg: Float32) -> None:
+        """Cache the controller's actual time remaining before release."""
+        with self._gesture_lock:
+            self._release_remaining_seconds = max(0.0, float(msg.data))
+            self._countdown_updated_at = time.monotonic()
+
+    def _draw_hand_overlay(self, image: np.ndarray, now: float) -> None:
+        with self._gesture_lock:
+            state = self._control_state
+            is_open = (
+                self._open_palm_detected
+                and now - self._open_palm_updated_at <= 0.5
+            )
+            remaining = self._release_remaining_seconds
+            countdown_fresh = now - self._countdown_updated_at <= 0.5
+
+        if state == 'DRIVE_TO_PLACE':
+            if is_open:
+                time_label = (
+                    f'Release in {remaining:.1f} s'
+                    if remaining is not None and countdown_fresh
+                    else 'Measuring hold time...'
+                )
+                lines = ['OPEN PALM DETECTED', time_label]
+                color = (0, 255, 0)
+            else:
+                lines = ['Show an open palm to release',
+                         'Hold for 2.0 s']
+                color = (0, 200, 255)
+        elif state == 'PLACING':
+            lines = ['OPEN PALM CONFIRMED', 'Opening gripper...']
+            color = (0, 255, 0)
+        elif state == 'RETURN_HOME':
+            lines = ['Returning HOME']
+            color = (0, 255, 0)
+        else:
+            return
+
+        panel_top = max(0, image.shape[0] - 86)
+        overlay = image.copy()
+        cv2.rectangle(
+            overlay,
+            (0, panel_top),
+            (min(image.shape[1], 560), image.shape[0]),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.addWeighted(overlay, 0.6, image, 0.4, 0.0, image)
+        for index, line in enumerate(lines):
+            cv2.putText(
+                image,
+                line,
+                (12, panel_top + 34 + index * 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
 
     def _draw_live_overlay(self, image: np.ndarray, now: float) -> None:
         with self._state_lock:
@@ -289,7 +396,7 @@ class VisionNode2(VisionNode):
             self._depth_label(snapshot.depth_m),
             self._base_point_label(snapshot.base_point),
             (
-                f'stable: {snapshot.stable_time:.1f} / '
+                f'accumulated: {snapshot.stable_time:.1f} / '
                 f'{self.stable_detection_duration:.1f} s'
             ),
         ]
@@ -346,7 +453,9 @@ class VisionNode2(VisionNode):
         """Refresh the OpenCV window from the process main thread."""
         if not self.show_debug_window or not self._window_available:
             return
-        if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        if not (
+            os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
+        ):
             if not self._window_warning_logged:
                 self.get_logger().warn(
                     'No desktop display detected; OpenCV window disabled. '

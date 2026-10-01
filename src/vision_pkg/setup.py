@@ -22,7 +22,7 @@ setup(
             glob(os.path.join('launch', '*.launch.py')),
         ),
     ],
-    install_requires=['numpy', 'setuptools', 'ultralytics'],
+    install_requires=['mediapipe==0.10.18', 'numpy', 'setuptools', 'ultralytics'],
     zip_safe=True,
     maintainer='fcsl',
     maintainer_email='imsunghy@gmail.com',
@@ -37,6 +37,7 @@ setup(
         'console_scripts': [
             'vision_node = vision_pkg.vision_node:main',
             'vision_node2 = vision_pkg.vision_node2:main',
+            'hand_gesture_node = vision_pkg.hand_gesture_node:main',
         ],
     },
 )

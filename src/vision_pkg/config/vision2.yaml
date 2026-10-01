@@ -6,7 +6,7 @@ vision_node2:
     camera_info_topic: /realsense/d435i/color/camera_info
     camera_frame: d435i_color_optical_frame
     target_frame: base_link
-    stable_detection_duration: 3.0
+    stable_detection_duration: 2.0
     recognition_timeout: 10.0
     depth_window_size: 7
     depth_scale: 0.001
@@ -20,3 +20,7 @@ vision_node2:
     show_debug_window: true
     debug_window_title: EATED Vision - live / on-demand YOLO
     overlay_max_age: 1.0
+hand_gesture_node:
+  ros__parameters:
+    rgb_topic: /realsense/d435i/color/image_raw
+    max_detection_rate_hz: 10.0

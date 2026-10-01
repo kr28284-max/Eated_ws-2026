@@ -11,25 +11,31 @@ from control_msgs.action import FollowJointTrajectory, GripperCommand
 from eated_interfaces.action import FindObject
 from eated_interfaces.msg import RobotCommand, RobotCommandStatus
 from geometry_msgs.msg import Pose, Twist
-from moveit_msgs.action import MoveGroup
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     Constraints,
     MoveItErrorCodes,
     OrientationConstraint,
     PositionConstraint,
 )
+from moveit_msgs.srv import GetCartesianPath
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import JointState, Joy
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float32, String
+from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from control_pkg.command_protocol import DEFAULT_SUPPORTED_TARGETS
+from control_pkg.command_protocol import STOP_ACTION
 from control_pkg.command_protocol import validate_voice_command
+from control_pkg.open_palm_gate import OpenPalmGate
 from control_pkg.task_state import TaskState, manual_drive_allowed
 
 
@@ -57,6 +63,14 @@ class ControlNode(Node):
 
         self._declare_parameters()
         self._read_parameters()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(
+            self.tf_buffer, self, spin_thread=False
+        )
+        self._palm_gate = OpenPalmGate(
+            self.open_palm_hold_sec,
+            self.open_palm_max_gap_sec,
+        )
 
         transient_qos = QoSProfile(depth=1)
         transient_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -76,6 +90,13 @@ class ControlNode(Node):
             10,
             callback_group=self.callback_group,
         )
+        self.palm_subscription = self.create_subscription(
+            Bool,
+            '/vision/open_palm',
+            self.palm_callback,
+            10,
+            callback_group=self.callback_group,
+        )
         self.joint_subscription = self.create_subscription(
             JointState,
             '/joint_states',
@@ -86,6 +107,11 @@ class ControlNode(Node):
         self.status_publisher = self.create_publisher(
             RobotCommandStatus,
             '/control/command_status',
+            10,
+        )
+        self.release_countdown_publisher = self.create_publisher(
+            Float32,
+            '/control/release_countdown_sec',
             10,
         )
         self.target_publisher = self.create_publisher(
@@ -134,9 +160,21 @@ class ControlNode(Node):
             '/move_action',
             callback_group=self.callback_group,
         )
+        self.cartesian_path_client = self.create_client(
+            GetCartesianPath,
+            '/compute_cartesian_path',
+            callback_group=self.callback_group,
+        )
+        self.execute_trajectory_client = ActionClient(
+            self,
+            ExecuteTrajectory,
+            '/execute_trajectory',
+            callback_group=self.callback_group,
+        )
 
         self.state = TaskState.RETURN_HOME
         self.current_target_class = ''
+        self.last_requested_target_class = ''
         self.last_object_point: Optional[Tuple[float, float, float]] = None
         self._manual_drive_enabled = False
         self._publish_state()
@@ -152,7 +190,7 @@ class ControlNode(Node):
             'Control state machine ready: '
             f'targets={list(self.supported_targets)}, '
             f'buttons=A{self.recognition_button_index}/'
-            f'B{self.place_button_index}/X{self.home_button_index}/'
+            f'X{self.home_button_index}/'
             f'Y{self.emergency_button_index}'
         )
         if not self.pick_enabled:
@@ -173,7 +211,6 @@ class ControlNode(Node):
             list(DEFAULT_SUPPORTED_TARGETS),
         )
         self.declare_parameter('recognition_button_index', 0)
-        self.declare_parameter('place_button_index', 1)
         self.declare_parameter('home_button_index', 2)
         self.declare_parameter('emergency_button_index', 3)
         self.declare_parameter('home_on_startup', True)
@@ -184,15 +221,13 @@ class ControlNode(Node):
         )
         self.declare_parameter(
             'cargo_pose_deg',
-            [-73.0, -51.0, -14.0, 117.0],
-        )
-        self.declare_parameter(
-            'place_pose_deg',
-            [0.0, 77.0, -46.0, -43.0],
+            [-73.0, -30.0, 38.0, -10.0],
         )
         self.declare_parameter('joint_motion_duration_sec', 4.0)
         self.declare_parameter('recognition_settle_sec', 0.5)
         self.declare_parameter('release_settle_sec', 0.5)
+        self.declare_parameter('open_palm_hold_sec', 2.0)
+        self.declare_parameter('open_palm_max_gap_sec', 0.4)
         self.declare_parameter('action_server_timeout_sec', 10.0)
         self.declare_parameter('action_result_timeout_sec', 20.0)
         self.declare_parameter('vision_result_timeout_sec', 60.0)
@@ -201,9 +236,9 @@ class ControlNode(Node):
         self.declare_parameter('gripper_max_effort', 0.2)
         self.declare_parameter('grasp_position_threshold', -0.008)
         self.declare_parameter('pick_enabled', True)
-        self.declare_parameter('pick_calibration_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('pick_calibration_xyz_m', [0.02, 0.0, 0.0])
         self.declare_parameter('pregrasp_offset_xyz_m', [0.0, 0.0, 0.05])
-        self.declare_parameter('retreat_offset_xyz_m', [0.0, 0.0, 0.08])
+        self.declare_parameter('retreat_offset_xyz_m', [0.0, 0.0, 0.15])
         self.declare_parameter('move_group_name', 'arm')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('end_effector_link', 'end_effector_link')
@@ -217,6 +252,8 @@ class ControlNode(Node):
         self.declare_parameter('moveit_planning_time_sec', 3.0)
         self.declare_parameter('moveit_velocity_scale', 0.10)
         self.declare_parameter('moveit_acceleration_scale', 0.10)
+        self.declare_parameter('retreat_cartesian_step_m', 0.005)
+        self.declare_parameter('retreat_joint_jump_rad', 0.35)
 
     def _read_parameters(self) -> None:
         def value(name: str):
@@ -224,27 +261,26 @@ class ControlNode(Node):
 
         self.supported_targets = tuple(value('supported_targets'))
         self.recognition_button_index = int(value('recognition_button_index'))
-        self.place_button_index = int(value('place_button_index'))
         self.home_button_index = int(value('home_button_index'))
         self.emergency_button_index = int(value('emergency_button_index'))
         button_indices = {
             self.recognition_button_index,
-            self.place_button_index,
             self.home_button_index,
             self.emergency_button_index,
         }
-        if min(button_indices) < 0 or len(button_indices) != 4:
-            raise ValueError('A, B, X, and Y button indices must be unique')
+        if min(button_indices) < 0 or len(button_indices) != 3:
+            raise ValueError('A, X, and Y button indices must be unique')
         self.home_on_startup = bool(value('home_on_startup'))
         self.home_pose = self._pose_parameter(value('home_pose_deg'))
         self.recognition_pose = self._pose_parameter(
             value('recognition_pose_deg')
         )
         self.cargo_pose = self._pose_parameter(value('cargo_pose_deg'))
-        self.place_pose = self._pose_parameter(value('place_pose_deg'))
         self.joint_motion_duration = float(value('joint_motion_duration_sec'))
         self.recognition_settle = float(value('recognition_settle_sec'))
         self.release_settle = float(value('release_settle_sec'))
+        self.open_palm_hold_sec = float(value('open_palm_hold_sec'))
+        self.open_palm_max_gap_sec = float(value('open_palm_max_gap_sec'))
         self.server_timeout = float(value('action_server_timeout_sec'))
         self.result_timeout = float(value('action_result_timeout_sec'))
         self.vision_result_timeout = float(value('vision_result_timeout_sec'))
@@ -282,6 +318,16 @@ class ControlNode(Node):
                 raise ValueError(
                     'pick_enabled requires a measured retreat offset'
                 )
+            if (
+                abs(self.retreat_offset[0]) > 1e-6
+                or abs(self.retreat_offset[1]) > 1e-6
+            ):
+                raise ValueError(
+                    'retreat_offset_xyz_m must have zero X and Y '
+                    'for a vertical retreat'
+                )
+            if self.retreat_offset[2] <= 0:
+                raise ValueError('retreat_offset_xyz_m Z must be positive')
         self.move_group_name = str(value('move_group_name'))
         self.base_frame = str(value('base_frame'))
         self.end_effector_link = str(value('end_effector_link'))
@@ -300,6 +346,12 @@ class ControlNode(Node):
         self.moveit_acceleration_scale = float(
             value('moveit_acceleration_scale')
         )
+        self.retreat_cartesian_step = float(value('retreat_cartesian_step_m'))
+        self.retreat_joint_jump = float(value('retreat_joint_jump_rad'))
+        if self.retreat_cartesian_step <= 0 or self.retreat_joint_jump <= 0:
+            raise ValueError(
+                'Cartesian retreat step and joint jump must be positive'
+            )
 
     @staticmethod
     def _pose_parameter(values: Sequence[float]) -> list[float]:
@@ -330,7 +382,7 @@ class ControlNode(Node):
         return math.sqrt(sum(value * value for value in values))
 
     def command_callback(self, msg: RobotCommand) -> None:
-        """Accept a voice fetch command only while the controller is idle."""
+        """Handle fetch and stop commands from the ROS voice publisher."""
         decision = validate_voice_command(
             msg.action,
             msg.target_class,
@@ -338,17 +390,21 @@ class ControlNode(Node):
         )
         accepted = decision.accepted
         message = decision.message
+        if accepted and decision.action == STOP_ACTION:
+            self._handle_emergency_stop(source='voice')
+            self._publish_command_status(
+                True, decision.action, decision.target_class, message
+            )
+            return
         with self._lock:
             if accepted and self.state != TaskState.IDLE:
                 accepted = False
                 message = f'controller is busy in state {self.state.value}'
 
             if accepted:
-                self.current_target_class = decision.target_class
-                self.last_object_point = None
-                self._publish_target()
-                self._set_state(TaskState.DRIVE_TO_PICK)
-                self._set_manual_drive(True, force=True)
+                self.last_requested_target_class = decision.target_class
+                self._begin_recognition(decision.target_class)
+                message = 'recognition and Pick started'
 
         self._publish_command_status(
             accepted,
@@ -359,13 +415,13 @@ class ControlNode(Node):
         if accepted:
             self.get_logger().info(
                 f'Fetch target accepted: {decision.target_class}; '
-                'drive to the pickup area and press A'
+                'starting recognition and Pick now'
             )
         else:
             self.get_logger().warn(f'Voice command rejected: {message}')
 
     def joy_callback(self, msg: Joy) -> None:
-        """Dispatch rising edges for A/B/X/Y according to the task state."""
+        """Dispatch rising edges for A/X/Y according to the task state."""
         buttons = list(msg.buttons)
         if not self._previous_buttons:
             self._previous_buttons = [0] * len(buttons)
@@ -376,7 +432,6 @@ class ControlNode(Node):
             buttons,
             self.recognition_button_index,
         )
-        place = self._rising_edge(buttons, self.place_button_index)
         self._previous_buttons = buttons
 
         if emergency:
@@ -387,8 +442,6 @@ class ControlNode(Node):
             return
         if recognition:
             self._handle_recognition_request()
-        if place:
-            self._handle_place_request()
 
     def _rising_edge(self, buttons: Sequence[int], index: int) -> bool:
         current = 0 <= index < len(buttons) and buttons[index] == 1
@@ -398,42 +451,57 @@ class ControlNode(Node):
         )
         return current and not previous
 
+    def _begin_recognition(self, target_class: str) -> None:
+        """Claim the base and start the recognition/Pick worker."""
+        self.current_target_class = target_class
+        self.last_object_point = None
+        self._publish_target()
+        self._set_manual_drive(False, force=True)
+        self._publish_zero_velocity()
+        self._set_state(TaskState.MOVE_TO_RECOGNITION)
+        self._start_operation(self._recognition_pick_sequence)
+
     def _handle_recognition_request(self) -> None:
         with self._lock:
-            valid = (
-                self.state == TaskState.DRIVE_TO_PICK
-                and bool(self.current_target_class)
-            )
+            target = self.last_requested_target_class
+            valid = self.state == TaskState.IDLE and bool(target)
             if valid:
-                self._set_manual_drive(False, force=True)
-                self._publish_zero_velocity()
-                self._set_state(TaskState.MOVE_TO_RECOGNITION)
+                self._begin_recognition(target)
         if valid:
-            self.get_logger().info('A pressed: starting recognition sequence')
-            self._start_operation(self._recognition_pick_sequence)
+            self.get_logger().info(
+                f'A pressed: repeating recognition and Pick for {target}'
+            )
         else:
             self.get_logger().warn(
-                f'A ignored in state {self.state.value}; manual drive restored'
+                f'A ignored in state {self.state.value}: '
+                'no idle target is available'
             )
             self._restore_state_authority()
 
-    def _handle_place_request(self) -> None:
+    def palm_callback(self, msg: Bool) -> None:
+        """Release after the configured hold of fresh open-palm signals."""
         with self._lock:
-            valid = self.state == TaskState.DRIVE_TO_PLACE
-            if valid:
+            if self.state != TaskState.DRIVE_TO_PLACE:
+                self._palm_gate.reset()
+                return
+            now = time.monotonic()
+            triggered = self._palm_gate.observe(bool(msg.data), now)
+            remaining = self._palm_gate.remaining_seconds(now)
+            self.release_countdown_publisher.publish(
+                Float32(data=float(remaining))
+            )
+            if triggered:
                 self._set_manual_drive(False, force=True)
                 self._publish_zero_velocity()
                 self._set_state(TaskState.PLACING)
-        if valid:
-            self.get_logger().info('B pressed: starting place sequence')
-            self._start_operation(self._place_sequence)
-        else:
-            self.get_logger().warn(
-                f'B ignored in state {self.state.value}; manual drive restored'
+                self._start_operation(self._release_sequence)
+        if triggered:
+            self.get_logger().info(
+                f'Open palm held for {self.open_palm_hold_sec:.1f} seconds: '
+                'releasing at CARGO'
             )
-            self._restore_state_authority()
 
-    def _handle_emergency_stop(self) -> None:
+    def _handle_emergency_stop(self, source: str = 'Y') -> None:
         """Cancel active actions, hold the arm, and restore manual drive."""
         with self._lock:
             self._operation_id += 1
@@ -446,13 +514,13 @@ class ControlNode(Node):
         self._publish_arm_hold()
         self._set_manual_drive(True, force=True)
         self.get_logger().error(
-            'EMERGENCY STOP (Y): actions cancelled and joystick base '
+            f'EMERGENCY STOP ({source}): actions cancelled and joystick base '
             'control restored. Press X to return the arm HOME.'
         )
 
     def _handle_home_recovery(self) -> None:
         with self._lock:
-            valid = self.state == TaskState.ERROR and self._emergency_active
+            valid = self.state == TaskState.ERROR
             if valid:
                 self._stop_event.clear()
                 self._set_manual_drive(False, force=True)
@@ -460,12 +528,12 @@ class ControlNode(Node):
                 self._set_state(TaskState.RETURN_HOME)
         if valid:
             self.get_logger().info(
-                'X pressed after emergency stop: returning arm HOME'
+                'X pressed in ERROR: returning arm HOME'
             )
             self._start_operation(self._home_recovery_sequence)
         else:
             self.get_logger().warn(
-                'X ignored: HOME recovery is only available after Y'
+                'X ignored: HOME recovery is only available in ERROR'
             )
             self._restore_state_authority()
 
@@ -487,7 +555,11 @@ class ControlNode(Node):
         except OperationCancelled:
             return
         except Exception as exc:
-            self._fail_operation(operation_id, f'startup HOME failed: {exc}')
+            self._fail_operation(
+                operation_id,
+                f'startup HOME failed: {exc}',
+                auto_home=False,
+            )
 
     def _recognition_pick_sequence(self, operation_id: int) -> None:
         try:
@@ -515,14 +587,12 @@ class ControlNode(Node):
                 )
                 self._set_state(TaskState.RETURN_HOME, operation_id)
                 self._send_joint_pose(self.home_pose, operation_id, 'HOME')
-                self._set_state(TaskState.DRIVE_TO_PICK, operation_id)
-                self._set_manual_drive(True, force=True)
+                self._finish_task(operation_id)
                 return
 
             self._set_state(TaskState.PICKING, operation_id)
             pick_point = self._add_xyz(point, self.pick_calibration)
             pregrasp = self._add_xyz(pick_point, self.pregrasp_offset)
-            retreat = self._add_xyz(pick_point, self.retreat_offset)
             self._send_gripper(self.gripper_open, operation_id, 'OPEN')
             self._send_cartesian_pose(pregrasp, operation_id, 'PREGRASP')
             self.get_logger().info(
@@ -537,16 +607,18 @@ class ControlNode(Node):
                 accept_stall=True,
             )
             self.get_logger().info(
-                f'Lifting {self.retreat_offset[2] * 100.0:.1f} cm '
-                'from PICK to RETREAT'
+                f'Planning up to {self.retreat_offset[2] * 100.0:.1f} cm '
+                'of vertical lift from PICK'
             )
-            self._send_cartesian_pose(retreat, operation_id, 'RETREAT')
+            self._send_vertical_retreat(operation_id)
             self._set_state(TaskState.MOVE_TO_CARGO, operation_id)
             self._send_joint_pose(self.cargo_pose, operation_id, 'CARGO')
             self._set_state(TaskState.DRIVE_TO_PLACE, operation_id)
             self._set_manual_drive(True, force=True)
             self.get_logger().info(
-                'Object secured: drive to the place area and press B'
+                'Object secured: drive to the delivery area and show an '
+                f'open palm to the camera for {self.open_palm_hold_sec:.1f} '
+                'seconds'
             )
         except OperationCancelled:
             return
@@ -556,9 +628,8 @@ class ControlNode(Node):
                 f'recognition/pick failed: {exc}',
             )
 
-    def _place_sequence(self, operation_id: int) -> None:
+    def _release_sequence(self, operation_id: int) -> None:
         try:
-            self._send_joint_pose(self.place_pose, operation_id, 'PLACE')
             self._send_gripper(self.gripper_open, operation_id, 'OPEN')
             self._sleep_cancelable(self.release_settle, operation_id)
             self._set_state(TaskState.RETURN_HOME, operation_id)
@@ -567,7 +638,7 @@ class ControlNode(Node):
         except OperationCancelled:
             return
         except Exception as exc:
-            self._fail_operation(operation_id, f'place failed: {exc}')
+            self._fail_operation(operation_id, f'release failed: {exc}')
 
     def _home_recovery_sequence(self, operation_id: int) -> None:
         try:
@@ -581,7 +652,11 @@ class ControlNode(Node):
         except OperationCancelled:
             return
         except Exception as exc:
-            self._fail_operation(operation_id, f'HOME recovery failed: {exc}')
+            self._fail_operation(
+                operation_id,
+                f'HOME recovery failed: {exc}',
+                auto_home=False,
+            )
 
     def _finish_task(self, operation_id: int) -> None:
         self._ensure_active(operation_id)
@@ -813,6 +888,134 @@ class ControlNode(Node):
             f'({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f})'
         )
 
+    def _send_vertical_retreat(self, operation_id: int) -> None:
+        """Execute the collision-checked vertical path MoveIt can compute."""
+        self._ensure_active(operation_id)
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                self.end_effector_link,
+                Time(),
+                timeout=Duration(seconds=1.0),
+            )
+        except TransformException as exc:
+            self.get_logger().warn(
+                f'RETREAT skipped: tool pose is unavailable: {exc}'
+            )
+            return
+
+        with self._lock:
+            joints = (
+                list(self._current_joint_positions)
+                if self._current_joint_positions is not None
+                else None
+            )
+        if joints is None:
+            self.get_logger().warn(
+                'RETREAT skipped: current arm joint states are unavailable'
+            )
+            return
+
+        waypoint = Pose()
+        waypoint.position.x = transform.transform.translation.x
+        waypoint.position.y = transform.transform.translation.y
+        waypoint.position.z = (
+            transform.transform.translation.z + self.retreat_offset[2]
+        )
+        waypoint.orientation = transform.transform.rotation
+
+        deadline = time.monotonic() + self.server_timeout
+        while not self.cartesian_path_client.wait_for_service(timeout_sec=0.1):
+            self._ensure_active(operation_id)
+            if time.monotonic() >= deadline:
+                self.get_logger().warn(
+                    'RETREAT skipped: Cartesian path service is unavailable'
+                )
+                return
+
+        request = GetCartesianPath.Request()
+        request.header.frame_id = self.base_frame
+        request.start_state.is_diff = True
+        request.start_state.joint_state.name = list(self.JOINT_NAMES)
+        request.start_state.joint_state.position = joints
+        request.group_name = self.move_group_name
+        request.link_name = self.end_effector_link
+        request.waypoints = [waypoint]
+        request.max_step = self.retreat_cartesian_step
+        request.revolute_jump_threshold = self.retreat_joint_jump
+        request.avoid_collisions = True
+        request.max_velocity_scaling_factor = self.moveit_velocity_scale
+        request.max_acceleration_scaling_factor = (
+            self.moveit_acceleration_scale
+        )
+
+        try:
+            response = self._wait_future(
+                self.cartesian_path_client.call_async(request),
+                operation_id,
+                'MoveIt RETREAT Cartesian plan',
+                self.result_timeout,
+            )
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            self.get_logger().warn(f'RETREAT planning failed: {exc}')
+            return
+        if (
+            response.error_code.val != MoveItErrorCodes.SUCCESS
+            or not math.isfinite(response.fraction)
+            or response.fraction <= 0.0
+            or len(response.solution.joint_trajectory.points) < 2
+        ):
+            self.get_logger().warn(
+                'RETREAT skipped: MoveIt returned no executable path: '
+                f'fraction={response.fraction:.3f}, '
+                f'error={response.error_code.val}'
+            )
+            return
+
+        if response.fraction < 0.999:
+            self.get_logger().warn(
+                'RETREAT partially planned: '
+                f'{response.fraction * 100.0:.1f}% of '
+                f'{self.retreat_offset[2] * 100.0:.1f} cm; '
+                'executing the reachable vertical segment'
+            )
+
+        self._ensure_active(operation_id)
+        self._wait_for_server(
+            self.execute_trajectory_client,
+            'MoveIt trajectory execution',
+            operation_id,
+        )
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = response.solution
+        goal_handle = self._send_goal(
+            self.execute_trajectory_client,
+            goal,
+            operation_id,
+            'MoveIt RETREAT execution',
+        )
+        execution = self._wait_result(
+            goal_handle,
+            operation_id,
+            'MoveIt RETREAT execution',
+        )
+        if (
+            execution.status != GoalStatus.STATUS_SUCCEEDED
+            or execution.result.error_code.val != MoveItErrorCodes.SUCCESS
+        ):
+            raise RuntimeError(
+                'MoveIt RETREAT execution failed: '
+                f'error={execution.result.error_code.val}'
+            )
+        self.get_logger().info(
+            'RETREAT completed: executed '
+            f'{response.fraction * 100.0:.1f}% of the requested '
+            f'{self.retreat_offset[2] * 100.0:.1f} cm lift '
+            f'along {self.base_frame} Z'
+        )
+
     def _wait_for_server(
         self,
         client: ActionClient,
@@ -988,6 +1191,8 @@ class ControlNode(Node):
         with self._lock:
             old_state = self.state
             self.state = new_state
+            if old_state != new_state:
+                self._palm_gate.reset()
             self._publish_state()
         if old_state != new_state:
             self.get_logger().info(
@@ -1042,7 +1247,12 @@ class ControlNode(Node):
         status.message = message
         self.status_publisher.publish(status)
 
-    def _fail_operation(self, operation_id: int, message: str) -> None:
+    def _fail_operation(
+        self,
+        operation_id: int,
+        message: str,
+        auto_home: bool = True,
+    ) -> None:
         try:
             self._ensure_active(operation_id)
         except OperationCancelled:
@@ -1050,8 +1260,28 @@ class ControlNode(Node):
         self._cancel_active_goals()
         self._publish_zero_velocity()
         self._set_state(TaskState.ERROR, operation_id)
-        self._set_manual_drive(True, force=True)
         self.get_logger().error(message)
+        if not auto_home:
+            self._set_manual_drive(True, force=True)
+            return
+        self._set_manual_drive(False, force=True)
+        try:
+            self._set_state(TaskState.RETURN_HOME, operation_id)
+            self.get_logger().warn('Operation failed: returning arm HOME')
+            self._send_joint_pose(self.home_pose, operation_id, 'HOME')
+            self._finish_task(operation_id)
+        except OperationCancelled:
+            return
+        except Exception as exc:
+            try:
+                self._set_state(TaskState.ERROR, operation_id)
+            except OperationCancelled:
+                return
+            self._set_manual_drive(True, force=True)
+            self.get_logger().error(
+                f'Automatic HOME recovery failed: {exc}. '
+                'Press X to retry HOME.'
+            )
 
     def destroy_node(self) -> None:
         """Cancel active work and stop the mobile base before shutdown."""

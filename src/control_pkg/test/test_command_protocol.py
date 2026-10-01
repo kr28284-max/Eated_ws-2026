@@ -26,3 +26,8 @@ def test_unsupported_target_does_not_pass_validation():
 def test_all_planned_model_classes_are_supported():
     for target_class in ('airpod', 'coke', 'tissue', 'vaseline'):
         assert validate_voice_command('fetch', target_class).accepted is True
+
+
+def test_voice_stop_is_accepted_only_without_target():
+    assert validate_voice_command('stop', '').accepted is True
+    assert validate_voice_command('stop', 'airpod').accepted is False

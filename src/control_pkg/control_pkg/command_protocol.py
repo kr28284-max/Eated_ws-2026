@@ -5,6 +5,7 @@ from typing import Collection
 
 
 FETCH_ACTION = 'fetch'
+STOP_ACTION = 'stop'
 UNKNOWN_ACTION = 'unknown'
 DEFAULT_SUPPORTED_TARGETS = ('airpod', 'coke', 'tissue', 'vaseline')
 
@@ -35,6 +36,21 @@ def validate_voice_command(
             normalized_action,
             normalized_target,
             'LLM classified the request as unknown',
+        )
+
+    if normalized_action == STOP_ACTION:
+        if normalized_target:
+            return CommandDecision(
+                False,
+                normalized_action,
+                normalized_target,
+                'stop command must have an empty target_class',
+            )
+        return CommandDecision(
+            True,
+            normalized_action,
+            normalized_target,
+            'stop requested',
         )
 
     if normalized_action != FETCH_ACTION:

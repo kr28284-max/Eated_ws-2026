@@ -90,6 +90,41 @@ def get_median_depth(
     return float(np.median(valid_values))
 
 
+def get_detection_depth(
+    depth_image: np.ndarray,
+    detection: Detection,
+    encoding: str,
+    depth_scale: float,
+    window_size: int,
+) -> float | None:
+    """Read center depth, then search the inner half of the detected object."""
+    u, v = detection.center
+    depth = get_median_depth(
+        depth_image, u, v, encoding, depth_scale, window_size
+    )
+    if depth is not None:
+        return depth
+
+    height, width = depth_image.shape
+    half_width = max(1, int((detection.x2 - detection.x1) / 4))
+    half_height = max(1, int((detection.y2 - detection.y1) / 4))
+    x_start = max(0, u - half_width)
+    x_end = min(width, u + half_width + 1)
+    y_start = max(0, v - half_height)
+    y_end = min(height, v + half_height + 1)
+    if x_start >= x_end or y_start >= y_end:
+        return None
+
+    patch = depth_image[y_start:y_end, x_start:x_end]
+    values = np.asarray(patch, dtype=np.float64)
+    if encoding.upper() == '16UC1':
+        values *= depth_scale
+    valid = values[np.isfinite(values) & (values > 0.0)]
+    if valid.size < 10 or valid.size < 0.1 * values.size:
+        return None
+    return float(np.median(valid))
+
+
 def deproject_pixel(
     u: int,
     v: int,

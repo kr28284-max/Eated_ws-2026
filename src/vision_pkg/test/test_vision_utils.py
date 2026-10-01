@@ -3,6 +3,7 @@ import pytest
 
 from vision_pkg.vision_utils import Detection
 from vision_pkg.vision_utils import deproject_pixel
+from vision_pkg.vision_utils import get_detection_depth
 from vision_pkg.vision_utils import get_median_depth
 from vision_pkg.vision_utils import median_localization
 from vision_pkg.vision_utils import select_target_detection
@@ -51,6 +52,25 @@ def test_32fc1_depth_is_already_in_meters():
     depth = get_median_depth(image, 1, 0, '32FC1', 0.001, 3)
 
     assert depth == pytest.approx(0.5)
+
+
+def test_depth_uses_box_interior_when_center_has_no_depth():
+    image = np.full((30, 30), 3000, dtype=np.uint16)
+    image[10:21, 10:21] = 300
+    image[12:19, 12:19] = 0
+    detection = Detection('airpod', 0.9, 5, 5, 25, 25)
+
+    depth = get_detection_depth(image, detection, '16UC1', 0.001, 7)
+
+    assert depth == pytest.approx(0.3)
+
+
+def test_depth_rejects_sparse_values_in_detection():
+    image = np.zeros((30, 30), dtype=np.uint16)
+    image[10, 10] = 300
+    detection = Detection('airpod', 0.9, 5, 5, 25, 25)
+
+    assert get_detection_depth(image, detection, '16UC1', 0.001, 7) is None
 
 
 def test_deprojection_uses_optical_frame_convention():

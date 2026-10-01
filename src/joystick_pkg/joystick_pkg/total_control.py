@@ -9,20 +9,16 @@ from std_msgs.msg import Bool
 
 
 class TotalControl(Node):
-    """Drive the TurtleBot base and reserve task-transition buttons."""
+    """Drive the TurtleBot base and reserve task buttons."""
 
     def __init__(self) -> None:
         super().__init__('total_control_node')
 
         self.declare_parameter('recognition_button_index', 0)
-        self.declare_parameter('place_button_index', 1)
         self.declare_parameter('home_button_index', 2)
         self.declare_parameter('emergency_button_index', 3)
         self.recognition_button_index = int(
             self.get_parameter('recognition_button_index').value
-        )
-        self.place_button_index = int(
-            self.get_parameter('place_button_index').value
         )
         self.home_recovery_button_index = int(
             self.get_parameter('home_button_index').value
@@ -59,7 +55,6 @@ class TotalControl(Node):
         self.latest_buttons: list[int] = []
 
         self.previous_recognition_pressed = False
-        self.previous_place_pressed = False
         self.previous_home_recovery_pressed = False
         self.previous_emergency_stop_pressed = False
         self._button_count_warning_logged = False
@@ -85,9 +80,8 @@ class TotalControl(Node):
 
         self.get_logger().info(
             'TurtleBot base joystick control ready: '
-            f'recognition_button_index={self.recognition_button_index} '
-            '(reserved A), '
-            f'place_button_index={self.place_button_index} (reserved B)'
+            f'A={self.recognition_button_index} repeats the last target; '
+            'B is unused'
         )
         self.get_logger().info(
             'Safety buttons: '
@@ -101,15 +95,14 @@ class TotalControl(Node):
     def _validate_button_parameters(self) -> None:
         button_indices = {
             self.recognition_button_index,
-            self.place_button_index,
             self.home_recovery_button_index,
             self.emergency_stop_button_index,
         }
         if min(button_indices) < 0:
             raise ValueError('button indices must not be negative')
-        if len(button_indices) != 4:
+        if len(button_indices) != 3:
             raise ValueError(
-                'recognition, place, HOME recovery, and emergency-stop '
+                'recognition, HOME recovery, and emergency-stop '
                 'button indices must be different'
             )
 
@@ -135,7 +128,6 @@ class TotalControl(Node):
         recognition_pressed = self.get_button(
             self.recognition_button_index
         )
-        place_pressed = self.get_button(self.place_button_index)
         home_recovery_pressed = self.get_button(
             self.home_recovery_button_index
         )
@@ -151,15 +143,6 @@ class TotalControl(Node):
                 and not self.previous_recognition_pressed
             ):
                 self._gate_for_task_button('Recognition/A')
-                self.get_logger().info(
-                    'Recognition button pressed: '
-                    f'index={self.recognition_button_index}'
-                )
-            if place_pressed and not self.previous_place_pressed:
-                self._gate_for_task_button('Place/B')
-                self.get_logger().info(
-                    f'Place button pressed: index={self.place_button_index}'
-                )
             if (
                 emergency_stop_pressed
                 and not self.previous_emergency_stop_pressed
@@ -201,7 +184,6 @@ class TotalControl(Node):
                 self.target_angular = 0.0
 
         self.previous_recognition_pressed = recognition_pressed
-        self.previous_place_pressed = place_pressed
         self.previous_home_recovery_pressed = home_recovery_pressed
         self.previous_emergency_stop_pressed = emergency_stop_pressed
 
@@ -250,7 +232,6 @@ class TotalControl(Node):
     def _warn_if_button_indices_unavailable(self) -> None:
         required_count = max(
             self.recognition_button_index,
-            self.place_button_index,
             self.home_recovery_button_index,
             self.emergency_stop_button_index,
         ) + 1

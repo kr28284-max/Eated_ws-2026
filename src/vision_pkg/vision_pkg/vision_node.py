@@ -29,7 +29,7 @@ from ultralytics import YOLO
 
 from vision_pkg.vision_utils import Detection
 from vision_pkg.vision_utils import deproject_pixel
-from vision_pkg.vision_utils import get_median_depth
+from vision_pkg.vision_utils import get_detection_depth
 from vision_pkg.vision_utils import median_localization
 from vision_pkg.vision_utils import select_target_detection
 
@@ -170,7 +170,7 @@ class VisionNode(Node):
             'd435i_color_optical_frame',
         )
         self.declare_parameter('target_frame', 'base_link')
-        self.declare_parameter('stable_detection_duration', 3.0)
+        self.declare_parameter('stable_detection_duration', 2.0)
         self.declare_parameter('recognition_timeout', 10.0)
         self.declare_parameter('depth_window_size', 7)
         self.declare_parameter('depth_scale', 0.001)
@@ -359,7 +359,9 @@ class VisionNode(Node):
 
     def _run_recognition(self, goal_handle, target_class: str):
         started_at = time.monotonic()
-        stable_started_at: Optional[float] = None
+        detected_at: Optional[float] = None
+        detected_time = 0.0
+        last_observation_error = 'target not detected'
         samples: list[tuple[float, float, float, float]] = []
         last_processed_sequence = -1
         next_inference_at = started_at
@@ -375,7 +377,12 @@ class VisionNode(Node):
             if now - started_at >= self.recognition_timeout:
                 goal_handle.abort()
                 return self._failure_result(
-                    'Target was not stably detected before timeout.'
+                    'Recognition timed out: '
+                    f'valid detection time={detected_time:.2f}/'
+                    f'{self.stable_detection_duration:.2f}s, '
+                    f'position samples={len(samples)}/'
+                    f'{self.min_valid_samples}; '
+                    f'last error={last_observation_error}'
                 )
 
             if now < next_inference_at:
@@ -388,13 +395,15 @@ class VisionNode(Node):
             )
             if frame_data is None:
                 if self._camera_stream_is_stale(now):
-                    stable_started_at = None
-                    samples.clear()
+                    detected_at = None
+                    last_observation_error = 'no synchronized RGB/depth frame'
                     self._log_frame_error(
                         'no synchronized RGB/depth frame'
                     )
                 if now - last_feedback_at >= 0.5:
-                    self._publish_feedback(goal_handle, False, 0.0, 0.0)
+                    self._publish_feedback(
+                        goal_handle, False, detected_time, 0.0
+                    )
                     last_feedback_at = now
                 continue
 
@@ -404,9 +413,9 @@ class VisionNode(Node):
 
             frame_error = self._validate_frame_age(rgb_msg)
             if frame_error:
-                stable_started_at = None
-                samples.clear()
-                self._publish_feedback(goal_handle, False, 0.0, 0.0)
+                detected_at = None
+                last_observation_error = frame_error
+                self._publish_feedback(goal_handle, False, detected_time, 0.0)
                 self._log_frame_error(frame_error)
                 continue
 
@@ -418,19 +427,21 @@ class VisionNode(Node):
             observation_time = time.monotonic()
 
             if observation.detection is None:
-                stable_started_at = None
-                samples.clear()
-                self._publish_feedback(goal_handle, False, 0.0, 0.0)
-                self.publish_debug_image(observation, 0.0)
-                self._log_observation(observation, 0.0, len(samples))
+                detected_at = None
+                last_observation_error = observation.error
+                self._publish_feedback(goal_handle, False, detected_time, 0.0)
+                self.publish_debug_image(observation, detected_time)
+                self._log_observation(observation, detected_time, len(samples))
                 continue
 
-            if stable_started_at is None:
-                stable_started_at = observation_time
-                samples.clear()
-            stable_time = observation_time - stable_started_at
-
-            if observation.base_point is not None:
+            if observation.base_point is None:
+                detected_at = None
+                last_observation_error = observation.error
+            else:
+                if detected_at is not None:
+                    detected_time += observation_time - detected_at
+                detected_at = observation_time
+                last_observation_error = ''
                 samples.append(
                     (
                         observation.base_point[0],
@@ -439,10 +450,11 @@ class VisionNode(Node):
                         observation.detection.confidence,
                     )
                 )
+            stable_time = detected_time
 
             self._publish_feedback(
                 goal_handle,
-                True,
+                observation.base_point is not None,
                 stable_time,
                 observation.detection.confidence,
             )
@@ -526,10 +538,9 @@ class VisionNode(Node):
                 depth_msg,
                 desired_encoding='passthrough',
             )
-            observation.depth_m = get_median_depth(
+            observation.depth_m = get_detection_depth(
                 np.asarray(depth_image),
-                u,
-                v,
+                detection,
                 depth_msg.encoding,
                 self.depth_scale,
                 self.depth_window_size,
@@ -675,7 +686,7 @@ class VisionNode(Node):
                 self._depth_label(observation.depth_m),
                 self._base_point_label(observation.base_point),
                 (
-                    f'stable: {stable_time:.1f} / '
+                    f'accumulated: {stable_time:.1f} / '
                     f'{self.stable_detection_duration:.1f} s'
                 ),
             ]
@@ -775,7 +786,7 @@ class VisionNode(Node):
         detection = observation.detection
         if detection is None:
             self.get_logger().info(
-                f'target not detected; stable=0.0/'
+                f'target not detected; accumulated={stable_time:.2f}/'
                 f'{self.stable_detection_duration:.1f}s'
             )
         else:
@@ -787,7 +798,7 @@ class VisionNode(Node):
                 f'depth={self._format_depth(observation.depth_m)}; '
                 f'camera={self._format_point(observation.camera_point)}; '
                 f'base={self._format_point(observation.base_point)}; '
-                f'stable={stable_time:.2f}/'
+                f'accumulated={stable_time:.2f}/'
                 f'{self.stable_detection_duration:.2f}s; '
                 f'samples={sample_count}; error={observation.error or "none"}'
             )

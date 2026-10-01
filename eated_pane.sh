@@ -15,6 +15,11 @@ fi
 
 source /opt/ros/humble/setup.bash
 source "$WORKSPACE/install/setup.bash"
+# ROS console scripts use /usr/bin/python3. Add the project Python packages to
+# their import path so the vision node can load Jetson PyTorch and Ultralytics.
+if [[ -d "$WORKSPACE/.venv/lib/python3.10/site-packages" ]]; then
+    export PYTHONPATH="$WORKSPACE/.venv/lib/python3.10/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+fi
 set -u
 cd "$WORKSPACE" || exit 1
 
@@ -22,7 +27,7 @@ case "$PANE_NUMBER" in
     1)
         title="1. HARDWARE"
         hint="먼저 실행하고 모든 controller가 active가 될 때까지 기다리세요."
-        command="export LDS_MODEL=LDS-02 && ros2 launch turtlebot3_manipulation_bringup hardware.launch.py use_fake_hardware:=false start_rviz:=false"
+        command="sg dialout -c $WORKSPACE/eated_hardware.sh"
         ;;
     2)
         title="2. MOVEIT"
@@ -55,9 +60,9 @@ case "$PANE_NUMBER" in
         command="ros2 launch control_pkg control.launch.py"
         ;;
     8)
-        title="8. AIRPOD COMMAND"
-        hint="7번 Control Node가 IDLE이 된 다음 Enter를 누르세요."
-        command="ros2 topic pub --once /voice/robot_command eated_interfaces/msg/RobotCommand \"{action: fetch, target_class: airpod, transcript: '에어팟 가져다줘'}\""
+        title="8. ROBOT COMMAND ECHO"
+        hint="노트북에서 발행하는 음성 명령 토픽을 표시합니다. Enter를 눌러 구독을 시작하세요."
+        command="ros2 topic echo /voice/robot_command eated_interfaces/msg/RobotCommand"
         ;;
     9)
         title="9. STATE MONITOR"
